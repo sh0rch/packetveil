@@ -1019,9 +1019,20 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(*iph), 0);
         iph->check = csum_fold(ip_csum);
 
-        udp->check = 0;
         udp->source = inner_sport_ne;
         udp->dest = inner_dport_ne;
+        udp->check = 0;
+
+        /* Compute a real checksum instead of leaving 0: RFC 768 permits
+         * zero, but conntrack on kernel >= 6.12 (nf_conntrack_checksum)
+         * marks such packets INVALID and firewalls often drop them. */
+        __u64 csum = bpf_csum_diff(0, 0, (__be32 *)&iph->saddr, 8, 0);
+        __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | (__u32)new_udp_len);
+        csum = bpf_csum_diff(0, 0, &ph, 4, csum);
+        csum = xdp_csum_range(ctx, scratch + 256, udp_off2, (__u32)new_udp_len, csum);
+        udp->check = csum_fold(csum);
+        if (udp->check == 0)
+            udp->check = 0xFFFF; /* a computed 0 is sent as 0xFFFF (RFC 768) */
     }
     else
     {
