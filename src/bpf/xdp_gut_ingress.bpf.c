@@ -148,6 +148,87 @@ static __always_inline void xor16(__u8 *p, const __u8 *k)
         p[i] ^= k[i];
 }
 
+/* Accumulate the one's-complement checksum of packet bytes [off, off+len).
+ * XDP twin of gut_csum_range() in gut_common.h: all bpf_xdp_load_bytes and
+ * bpf_csum_diff calls use LITERAL constant sizes so the verifier never has
+ * to infer a scalar range for the size argument.  buf64 must be a >=64-byte
+ * scratch region in map-value or stack memory (not packet data).  Same
+ * 1664-byte coverage cap as the egress side — longer datagrams get a wrong
+ * checksum and are dropped, identical to the previous check=0 behaviour. */
+static __always_inline __u64
+xdp_csum_range(struct xdp_md *ctx, __u8 *buf64,
+               __u32 off, __u32 len, __u64 acc)
+{
+    __u32 end = off + len;
+    if (end > off + 1664)
+        end = off + 1664; /* 26x64 — verifier scalar clamp */
+
+#pragma unroll
+    for (int i = 0; i < 26; i++)
+    {
+        if (off + 64 > end)
+            break;
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 64) < 0)
+            break;
+        acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 64, acc);
+        off += 64;
+    }
+
+    if (off + 32 <= end)
+    {
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 32) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 32, acc);
+        off += 32;
+    }
+    if (off + 16 <= end)
+    {
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 16) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 16, acc);
+        off += 16;
+    }
+    if (off + 8 <= end)
+    {
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 8) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 8, acc);
+        off += 8;
+    }
+    if (off + 4 <= end)
+    {
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 4) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 4, acc);
+        off += 4;
+    }
+
+    /* Trailing 1-3 bytes: RFC 768 zero-pad to 4 bytes */
+    {
+        __u8 tbuf[4] = {0, 0, 0, 0};
+        __be32 word = 0;
+        __u32 tail = end - off;
+        if (tail >= 1 && tail <= 3)
+        {
+            if (tail == 1)
+            {
+                bpf_xdp_load_bytes(ctx, off, tbuf, 1);
+                word = bpf_htonl(((__u32)tbuf[0]) << 24);
+            }
+            else if (tail == 2)
+            {
+                bpf_xdp_load_bytes(ctx, off, tbuf, 2);
+                word = bpf_htonl((((__u32)tbuf[0]) << 24) | (((__u32)tbuf[1]) << 16));
+            }
+            else
+            {
+                bpf_xdp_load_bytes(ctx, off, tbuf, 3);
+                word = bpf_htonl((((__u32)tbuf[0]) << 24) | (((__u32)tbuf[1]) << 16) |
+                                 (((__u32)tbuf[2]) << 8));
+            }
+            acc = bpf_csum_diff(0, 0, &word, 4, acc);
+        }
+    }
+
+    return acc;
+}
+
 #if defined(GUT_MODE_B64)
 /* Not needed as separate subprog — b64_decode is called inline to avoid
  * mark_precise explosion from noinline map-value invalidation. */
@@ -172,7 +253,6 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         return -1;
 
     __u16 eth_proto = eth->h_proto;
-    __be16 orig_eth_proto = eth->h_proto;
     __u32 ip_off = sizeof(*eth);
 
     /* VLAN (802.1Q) */
@@ -835,12 +915,13 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 
     /* ── Driver-agnostic packet resize: never touch frame boundaries ──────
-     * bpf_xdp_adjust_head() / bpf_xdp_adjust_tail() give driver-dependent
-     * results on virtio-net and other real NICs: the helpers return
-     * success yet mis-size the frame — silent no-ops on virtio mergeable
-     * RX, over-shrinks with mrg_rxbuf=off, off-by-one on e1000
-     * (issues #13/#18).  A wrong data_end means wrong-length or truncated
-     * WireGuard packets dropped silently in wg_packet_receive().
+     * bpf_xdp_adjust_head() / bpf_xdp_adjust_tail() produce results that
+     * depend on NIC buffer layout: on virtio-net with mergeable RX the
+     * shrink was a silent no-op, and with mrg_rxbuf=off it removed far
+     * more than requested (issue #13 measured a 71-byte cut for a 20-byte
+     * request).  Whatever the exact mechanism, the outcome was a wrong
+     * data_end — wrong-length or truncated WireGuard packets dropped
+     * silently in wg_packet_receive() (issues #13/#18).
      *
      * Fix: do NOT resize the XDP frame at all.  Slide the WG inner payload
      * backward over the outer header using scratch as a relay (a pure
@@ -873,12 +954,35 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      *   SIP_SCAN_OFF   @ scratch[2560..3583] — SIP mode only, already consumed
      * scratch[512..512+MAX_INNER_TECH_LIMIT-1] is free for all modes here. */
     __u32 src_pkt_off = (wg_off + outer_hdr_len) & 0xFFFF;
+
+    /* Strip an inline 802.1Q tag if present: ip_off > sizeof(*eth) means
+     * a 4-byte tag sits between the EtherType and the IP header.  A tagged
+     * frame arriving on gut0 finds no VLAN sub-interface, is marked
+     * PACKET_OTHERHOST, and is dropped by ip_rcv — so deliver it untagged
+     * instead.  The tag is removed by shifting IP+UDP headers left over it
+     * (scratch relay, no frame resize — same mechanism as the payload slide
+     * below).  The header copy MUST precede the payload store: writing the
+     * payload at wg_off-4 would clobber the last 4 source header bytes at
+     * [wg_off-4, wg_off) before they are copied. */
+    __u32 tag_adj = ip_off - sizeof(*eth); /* 0 (untagged) or 4 (802.1Q) */
+    if (tag_adj)
+    {
+        __u32 hlen = wg_off - ip_off; /* IP+UDP headers: 28 (v4) / 48 (v6) */
+        asm volatile("" : "+r"(hlen));
+        if (hlen > 56)
+            return -1;
+        if (bpf_xdp_load_bytes(ctx, ip_off, scratch + 256, hlen) < 0)
+            return -1;
+        if (bpf_xdp_store_bytes(ctx, ip_off - tag_adj, scratch + 256, hlen) < 0)
+            return -1;
+    }
+
     if (bpf_xdp_load_bytes(ctx, src_pkt_off, scratch + 512, inner_wg_len) < 0)
         return -1;
 
-    /* Write WG payload at wg_off, overwriting the outer header.
+    /* Write WG payload at wg_off(-tag_adj), overwriting the outer header.
      * Eth+IP+UDP headers at [0, wg_off) are not touched by this store. */
-    if (bpf_xdp_store_bytes(ctx, wg_off, scratch + 512, inner_wg_len) < 0)
+    if (bpf_xdp_store_bytes(ctx, wg_off - tag_adj, scratch + 512, inner_wg_len) < 0)
     {
         stats->packets_dropped++;
         return -1;
@@ -895,14 +999,19 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if ((void *)(eth + 1) > data_end)
         return -1;
 
+    /* Header positions after the optional VLAN shift: everything left of
+     * wg_off moved tag_adj bytes toward the start. */
+    __u32 ip_off2 = ip_off - tag_adj;
+    __u32 udp_off2 = udp_off - tag_adj;
+
     __u32 inner_new_len = (ipver == 6) ? (40 + (__u32)new_udp_len) : (20 + (__u32)new_udp_len);
-    if ((__u8 *)data + ip_off + inner_new_len > (__u8 *)data_end)
+    if ((__u8 *)data + ip_off2 + inner_new_len > (__u8 *)data_end)
         return -1;
 
     if (ipver == 4)
     {
-        struct iphdr *iph = (void *)((__u8 *)data + ip_off);
-        struct udphdr *udp = (void *)((__u8 *)data + udp_off);
+        struct iphdr *iph = (void *)((__u8 *)data + ip_off2);
+        struct udphdr *udp = (void *)((__u8 *)data + udp_off2);
         if ((void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end)
             return -1;
 
@@ -916,27 +1025,35 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
     else
     {
-        struct ipv6hdr *ip6h = (void *)((__u8 *)data + ip_off);
-        struct udphdr *udp = (void *)((__u8 *)data + udp_off);
+        struct ipv6hdr *ip6h = (void *)((__u8 *)data + ip_off2);
+        struct udphdr *udp = (void *)((__u8 *)data + udp_off2);
         if ((void *)(ip6h + 1) > data_end || (void *)(udp + 1) > data_end)
             return -1;
 
         udp->source = inner_sport_ne;
         udp->dest = inner_dport_ne;
-
-        /* IPv6 UDP checksum is mandatory per RFC 8200, but we deliver via
-         * bpf_redirect_map → local veth which sets CHECKSUM_UNNECESSARY on
-         * the skb — the stack will not validate it.  Full recomputation via
-         * calc_payload_csum is too expensive here (register pressure). */
         udp->check = 0;
+
+        /* UDPv6 checksum is mandatory (RFC 8200): __udp6_lib_rcv drops a
+         * zero checksum unless the socket sets no_check6_rx, and the WG
+         * socket does not — so compute the real value: pseudo-header +
+         * UDP header (check=0) + payload, summed from the packet over
+         * [udp_off2, udp_off2+new_udp_len). */
+        __u64 csum = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0);
+        __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | (__u32)new_udp_len);
+        csum = bpf_csum_diff(0, 0, &ph, 4, csum);
+        csum = xdp_csum_range(ctx, scratch + 256, udp_off2, (__u32)new_udp_len, csum);
+        udp->check = csum_fold(csum);
+        if (udp->check == 0)
+            udp->check = 0xFFFF; /* a computed 0 is sent as 0xFFFF (RFC 768) */
     }
 
     __builtin_memcpy(eth->h_dest, cfg->tun_mac, 6);
     __builtin_memcpy(eth->h_source, cfg->src_mac, 6);
-    /* Preserve the original ethertype: for VLAN-tagged ingress the 802.1Q
-     * tag is still in place at ip_off-4, so forcing ETH_P_IP/IPV6 here
-     * would corrupt the delivered frame. */
-    eth->h_proto = orig_eth_proto;
+    /* Deliver untagged: for VLAN ingress the tag was removed above, so
+     * the inner protocol is the right EtherType; for untagged ingress this
+     * is the original value anyway. */
+    eth->h_proto = (__be16)eth_proto;
 
     stats->mask_count++;
     stats->packets_processed++;
