@@ -933,6 +933,36 @@ impl TcBpfManager {
                                 )
                                 .into());
                             }
+                            // SKB-mode XDP on the veth peer: the veth driver's
+                            // ndo_xdp_xmit sees rq->xdp_prog == NULL and silently
+                            // drops EVERY devmap-redirected frame on kernel >= 6.1.
+                            // Starting in this state produces a guaranteed-broken
+                            // data path with zero error counters - make it fatal
+                            // unless the operator explicitly opts out.
+                            let k61_or_newer = Self::check_kernel_version()
+                                .map(|(maj, min, _)| maj > 6 || (maj == 6 && min >= 1))
+                                .unwrap_or(true);
+                            let allow_skb = std::env::var("GUTD_ALLOW_SKB_VETH")
+                                .map(|v| v == "1")
+                                .unwrap_or(false);
+                            if k61_or_newer && !allow_skb {
+                                unsafe {
+                                    libbpf_sys::bpf_xdp_attach(
+                                        tun_ifindex,
+                                        -1,
+                                        skb_flags,
+                                        std::ptr::null(),
+                                    );
+                                }
+                                return Err(format!(
+                                    "veth_pass only attaches in SKB (generic) XDP mode on '{ifname}', \
+                                     but devmap redirect into a veth peer requires a native (DRV) program \
+                                     on kernel >= 6.1 - every decoded packet would be silently dropped. \
+                                     Check driver/kernel XDP support for the veth peer, or set \
+                                     GUTD_ALLOW_SKB_VETH=1 to start anyway (broken data path)."
+                                )
+                                .into());
+                            }
                             eprintln!(
                                 "    WARNING: veth_pass in SKB mode — devmap redirect from \
                                  native XDP will silently drop packets on kernel 6.1+. \
