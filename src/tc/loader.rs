@@ -1635,8 +1635,8 @@ impl TcBpfManager {
             eprintln!("  [gw-mac] /proc/net/route not readable");
             return None;
         };
-        let mut gw_exact: Option<std::net::Ipv4Addr> = None; // matches ifname
-        let mut gw_any: Option<std::net::Ipv4Addr> = None; // any interface
+        let mut gw_exact: Option<(std::net::Ipv4Addr, String)> = None; // matches ifname
+        let mut gw_any: Option<(std::net::Ipv4Addr, String)> = None; // any interface
         for line in content.lines().skip(1) {
             let mut f = line.split_whitespace();
             let Some(iface) = f.next() else { continue };
@@ -1659,24 +1659,35 @@ impl TcBpfManager {
             if dest == 0 && mask == 0 && flags & 0x3 == 0x3 && gw != 0 {
                 let ip = std::net::Ipv4Addr::from(gw.to_ne_bytes());
                 if iface == ifname {
-                    gw_exact = Some(ip);
+                    gw_exact = Some((ip, iface.to_string()));
                     break; // exact interface match — stop searching
                 } else if gw_any.is_none() {
-                    gw_any = Some(ip); // keep as fallback
+                    gw_any = Some((ip, iface.to_string())); // keep as fallback
                 }
             }
         }
-        let gw = match gw_exact.or(gw_any) {
-            Some(ip) => ip,
+        let (gw, dev) = match gw_exact.or(gw_any) {
+            Some(pair) => pair,
             None => {
                 eprintln!("  [gw-mac] no default gateway found in /proc/net/route for {ifname}");
                 return None;
             }
         };
-        eprintln!("  [gw-mac] probing gateway {gw} on {ifname}");
+        // Probe on the route's egress device, not necessarily the XDP NIC:
+        // when the NIC is a bridge slave (no IP), ARP on it always fails while
+        // the neighbor lives on the bridge master. The resolved MAC is still
+        // the correct L2 next-hop for frames leaving the slave port.
+        let dev = dev.as_str();
+        if dev != ifname {
+            eprintln!(
+                "  [gw-mac] default route egresses via {dev}, not {ifname} \
+                 (bridge slave?) - probing gateway there"
+            );
+        }
+        eprintln!("  [gw-mac] probing gateway {gw} on {dev}");
         // Method 1: ARP Request + receive reply directly via AF_PACKET.
         // Works even when /proc/net/arp and RTM_GETNEIGH are empty (RouterOS containers).
-        if let Some(mac) = crate::netlink::arp_request_reply(gw, ifname) {
+        if let Some(mac) = crate::netlink::arp_request_reply(gw, dev) {
             eprintln!(
                 "  [gw-mac] gateway MAC resolved via ARP reply: {:02x?}",
                 mac
@@ -1694,7 +1705,7 @@ impl TcBpfManager {
             let [a, b, c, _] = gw.octets();
             std::net::Ipv4Addr::new(a, b, c, 200)
         });
-        if let Some(mac) = crate::netlink::resolve_mac_via_ttl_probe(gw, probe_dst, ifname) {
+        if let Some(mac) = crate::netlink::resolve_mac_via_ttl_probe(gw, probe_dst, dev) {
             eprintln!(
                 "  [gw-mac] gateway MAC resolved via TTL probe: {:02x?}",
                 mac
@@ -1705,10 +1716,10 @@ impl TcBpfManager {
         // Used when CAP_NET_RAW is absent (AF_PACKET unavailable).
         let gw_addr = std::net::IpAddr::V4(gw);
         for _ in 0..8 {
-            if let Some(mac) = lookup_arp_cache(gw, ifname) {
+            if let Some(mac) = lookup_arp_cache(gw, dev) {
                 return Some(mac);
             }
-            probe_neighbor_udp(gw_addr, ifname);
+            probe_neighbor_udp(gw_addr, dev);
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         // Diagnostic: dump /proc/net/arp to help understand why lookup failed
@@ -1718,7 +1729,7 @@ impl TcBpfManager {
             }
             _ => eprintln!("  [gw-mac] /proc/net/arp: empty or unreadable"),
         }
-        eprintln!("  [gw-mac] ARP for gateway {gw} on {ifname} failed after retries");
+        eprintln!("  [gw-mac] ARP for gateway {gw} on {dev} failed after retries");
         None
     }
 
@@ -1823,9 +1834,19 @@ impl TcBpfManager {
         gut_config.tun_ifindex = Self::get_ifindex(tun_ifname)? as u32;
         gut_config.src_mac = Self::read_iface_mac(ingress_ifname)?;
         if config.peer().dynamic_peer {
-            // Dynamic peer: can't ARP for unknown peer. Use default gateway MAC.
-            gut_config.dst_mac = Self::resolve_default_gateway_mac(ingress_ifname, None)
-                .ok_or("dynamic_peer: cannot resolve default gateway MAC on ingress NIC")?;
+            // Dynamic peer: can't ARP for unknown peer. Default gateway MAC is
+            // only a fallback - replies use the per-peer L2 next-hop learned
+            // from inbound frames, so an unresolvable gateway is not fatal.
+            match Self::resolve_default_gateway_mac(ingress_ifname, None) {
+                Some(mac) => gut_config.dst_mac = mac,
+                None => {
+                    eprintln!(
+                        "  WARNING: could not resolve a default gateway MAC for \
+                         dynamic_peer fallback - relying on learned per-peer MACs"
+                    );
+                    gut_config.dst_mac = [0; 6];
+                }
+            }
         } else {
             gut_config.dst_mac = Self::resolve_peer_mac(config.peer().peer_ip, ingress_ifname)?;
         }
