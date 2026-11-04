@@ -351,7 +351,7 @@ int gut_egress(struct __sk_buff *skb)
     if (cfg->dynamic_peer)
     {
         if (wg_type == 1)
-            return TC_ACT_OK; /* drop server-initiated rekey; client will retry */
+            return TC_ACT_SHOT; /* drop server-initiated rekey; client will retry */
 
         if (wg_type == 4 || wg_type == 3)
         {
@@ -1065,7 +1065,10 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
         {
             struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
             if (!ep || !ep->valid)
+            {
+                bpf_debug("TC: drop wg_type=%u c_idx=%u: no entry in client_map (hdr-rewrite4)", wg_type, c_idx);
                 return TC_ACT_OK;
+            }
             if (ep->server_ip4 != 0)
                 __builtin_memcpy(&iph->saddr, &ep->server_ip4, 4);
             else
@@ -1125,7 +1128,10 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
         {
             struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
             if (!ep || !ep->valid)
+            {
+                bpf_debug("TC: drop wg_type=%u c_idx=%u: no entry in client_map (hdr-rewrite6)", wg_type, c_idx);
                 return TC_ACT_OK;
+            }
             __u64 s6_1 = ((__u64 *)ep->server_ip6)[0];
             __u64 s6_2 = ((__u64 *)ep->server_ip6)[1];
             if (s6_1 != 0 || s6_2 != 0)
@@ -1286,7 +1292,10 @@ int gut_egress_quic_long(struct __sk_buff *skb)
         {
             struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
             if (!ep || !ep->valid)
+            {
+                bpf_debug("TC: drop wg_type=%u c_idx=%u: no entry in client_map (hdr-rewrite4)", wg_type, c_idx);
                 return TC_ACT_OK;
+            }
             if (ep->server_ip4 != 0)
                 __builtin_memcpy(&iph->saddr, &ep->server_ip4, 4);
             else
@@ -1346,7 +1355,10 @@ int gut_egress_quic_long(struct __sk_buff *skb)
         {
             struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
             if (!ep || !ep->valid)
+            {
+                bpf_debug("TC: drop wg_type=%u c_idx=%u: no entry in client_map (hdr-rewrite6)", wg_type, c_idx);
                 return TC_ACT_OK;
+            }
             __u64 s6_1 = ((__u64 *)ep->server_ip6)[0];
             __u64 s6_2 = ((__u64 *)ep->server_ip6)[1];
             if (s6_1 != 0 || s6_2 != 0)
