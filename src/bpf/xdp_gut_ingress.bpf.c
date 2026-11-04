@@ -745,6 +745,11 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             }
             ep.port = bpf_ntohs(udph->source);
             ep.server_port = bpf_ntohs(udph->dest);
+            /* The inbound frame's src MAC is always the correct L2 next-hop
+             * for replies: the peer's own MAC when on-link, the gateway's
+             * MAC when routed.  cfg->dst_mac (default-gw) is wrong for
+             * on-link/multi-homed peers. */
+            __builtin_memcpy(ep.mac, eth->h_source, 6);
             ep.valid = 1;
             ep.obfs_gut = 0;
             /* Type 1 (WG Init from client): use BPF_NOEXIST so we never overwrite a

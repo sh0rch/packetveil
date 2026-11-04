@@ -165,6 +165,7 @@ struct peer_endpoint
     __u32 server_ip4;    /* Last-seen IPv4 dest (server) */
     __u8 server_ip6[16]; /* Last-seen IPv6 dest (server) */
     __u16 server_port;   /* Last-seen UDP dest port (server) */
+    __u8 mac[6];         /* Last-seen L2 src MAC - the correct next-hop dst MAC for replies */
     __u8 valid;          /* 1 = endpoint learned, 0 = not yet */
     __u8 obfs_gut;       /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
 };

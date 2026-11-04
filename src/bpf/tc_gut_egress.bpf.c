@@ -224,6 +224,10 @@ int gut_egress(struct __sk_buff *skb)
         return TC_ACT_OK;
 #endif
 
+    /* Learned per-peer L2 next-hop (client_map.mac) — overrides cfg->dst_mac
+     * for dynamic peers so replies reach on-link and multi-homed clients. */
+    __u8 peer_mac[6] = {};
+
 #if defined(GUT_MODE_GUT) || defined(GUT_MODE_B64)
     __u32 outer_hdr_len = GUT_HEADER_SIZE;
 #else /* GUT_MODE_QUIC */
@@ -711,6 +715,7 @@ int gut_egress(struct __sk_buff *skb)
                 __builtin_memcpy(&iph->saddr, &cfg->bind_ip, 4);
             }
             __builtin_memcpy(&iph->daddr, &ep->ip4, 4);
+            __builtin_memcpy(peer_mac, ep->mac, 6);
             udph->dest = bpf_htons(ep->port);
             if (ep->server_port != 0)
             {
@@ -799,6 +804,7 @@ int gut_egress(struct __sk_buff *skb)
             }
 
             __builtin_memcpy(&ip6h->daddr, ep->ip6, 16);
+            __builtin_memcpy(peer_mac, ep->mac, 6);
             udph->dest = bpf_htons(ep->port);
             if (ep->server_port != 0)
             {
@@ -837,7 +843,12 @@ int gut_egress(struct __sk_buff *skb)
     }
 
     eth = data;
-    __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
+    /* Dynamic-peer replies use the L2 next-hop learned with the endpoint;
+     * cfg->dst_mac (default gateway) stays the fallback for static peers. */
+    if (peer_mac[0] | peer_mac[1] | peer_mac[2] | peer_mac[3] | peer_mac[4] | peer_mac[5])
+        __builtin_memcpy(eth->h_dest, peer_mac, 6);
+    else
+        __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
     __builtin_memcpy(eth->h_source, cfg->src_mac, 6);
 
     if (stats)
@@ -890,6 +901,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     __u32 ipver = tctx->ipver;
     __u32 wg_off = tctx->new_quic_off; /* WG payload offset in packet */
     __u32 outer_hdr_len = tctx->outer_hdr_len;
+    __u8 peer_mac[6] = {}; /* learned per-peer L2 next-hop; see gut_egress() */
 
     /* Re-bound outer_hdr_len for the verifier (lost range across map read) */
     if (outer_hdr_len < GUT_HEADER_SIZE || outer_hdr_len > 64)
@@ -1059,6 +1071,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             else
                 __builtin_memcpy(&iph->saddr, &cfg->bind_ip, 4);
             __builtin_memcpy(&iph->daddr, &ep->ip4, 4);
+            __builtin_memcpy(peer_mac, ep->mac, 6);
             udph->dest = bpf_htons(ep->port);
             if (ep->server_port != 0)
                 udph->source = bpf_htons(ep->server_port);
@@ -1120,6 +1133,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             else
                 __builtin_memcpy(&ip6h->saddr, cfg->bind_ip6, 16);
             __builtin_memcpy(&ip6h->daddr, ep->ip6, 16);
+            __builtin_memcpy(peer_mac, ep->mac, 6);
             udph->dest = bpf_htons(ep->port);
             if (ep->server_port != 0)
                 udph->source = bpf_htons(ep->server_port);
@@ -1161,7 +1175,12 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return TC_ACT_OK;
-    __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
+    /* Dynamic-peer replies use the L2 next-hop learned with the endpoint;
+     * cfg->dst_mac (default gateway) stays the fallback for static peers. */
+    if (peer_mac[0] | peer_mac[1] | peer_mac[2] | peer_mac[3] | peer_mac[4] | peer_mac[5])
+        __builtin_memcpy(eth->h_dest, peer_mac, 6);
+    else
+        __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
     __builtin_memcpy(eth->h_source, cfg->src_mac, 6);
 
     if (stats)
@@ -1215,6 +1234,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
     __u32 ipver = tctx->ipver;
     __u32 new_quic_off = tctx->new_quic_off;
     __u32 outer_hdr_len = tctx->outer_hdr_len;
+    __u8 peer_mac[6] = {}; /* learned per-peer L2 next-hop; see gut_egress() */
 
     /* Recompute pad_block from ChaCha(69, nonce) — same derivation as main program */
     __u32 *ks69 = (__u32 *)(scratch + 64);
@@ -1272,6 +1292,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             else
                 __builtin_memcpy(&iph->saddr, &cfg->bind_ip, 4);
             __builtin_memcpy(&iph->daddr, &ep->ip4, 4);
+            __builtin_memcpy(peer_mac, ep->mac, 6);
             udph->dest = bpf_htons(ep->port);
             if (ep->server_port != 0)
                 udph->source = bpf_htons(ep->server_port);
@@ -1333,6 +1354,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             else
                 __builtin_memcpy(&ip6h->saddr, cfg->bind_ip6, 16);
             __builtin_memcpy(&ip6h->daddr, ep->ip6, 16);
+            __builtin_memcpy(peer_mac, ep->mac, 6);
             udph->dest = bpf_htons(ep->port);
             if (ep->server_port != 0)
                 udph->source = bpf_htons(ep->server_port);
@@ -1374,7 +1396,12 @@ int gut_egress_quic_long(struct __sk_buff *skb)
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return TC_ACT_OK;
-    __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
+    /* Dynamic-peer replies use the L2 next-hop learned with the endpoint;
+     * cfg->dst_mac (default gateway) stays the fallback for static peers. */
+    if (peer_mac[0] | peer_mac[1] | peer_mac[2] | peer_mac[3] | peer_mac[4] | peer_mac[5])
+        __builtin_memcpy(eth->h_dest, peer_mac, 6);
+    else
+        __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
     __builtin_memcpy(eth->h_source, cfg->src_mac, 6);
 
     if (stats)
