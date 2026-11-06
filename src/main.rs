@@ -68,12 +68,12 @@ fn print_bpf_stats(managers: &[gutd::tc::TcBpfManager]) {
                 );
                 eprintln!(
                     "    Ingress: pkts={} drop={} bytes={} mask={} frag={} oversized={}",
-                    stats.egress.packets_ingress,
-                    stats.egress.packets_dropped,
-                    stats.egress.bytes_processed,
-                    stats.egress.mask_count,
-                    stats.egress.packets_fragmented,
-                    stats.egress.packets_oversized
+                    stats.ingress.packets_ingress,
+                    stats.ingress.packets_dropped,
+                    stats.ingress.bytes_processed,
+                    stats.ingress.mask_count,
+                    stats.ingress.packets_fragmented,
+                    stats.ingress.packets_oversized
                 );
             }
             Err(e) => eprintln!("  [{}] Failed to read BPF stats: {e}", manager.interface()),
@@ -429,6 +429,11 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
             let single = make_single(&config, peer);
             let mgr = TcBpfManager::new(&peer.name, &single, &mut dispatchers)?;
             managers.push(mgr);
+            // READY=1 was sent before setup, so the watchdog clock is already
+            // running - ping it per peer: MAC/route resolution can take seconds
+            // per peer on a lossy segment, and N peers must not sum past
+            // WatchdogSec for an otherwise healthy startup.
+            sd_notify("WATCHDOG=1");
         }
 
         eprintln!(
