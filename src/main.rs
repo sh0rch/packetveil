@@ -68,12 +68,12 @@ fn print_bpf_stats(managers: &[gutd::tc::TcBpfManager]) {
                 );
                 eprintln!(
                     "    Ingress: pkts={} drop={} bytes={} mask={} frag={} oversized={}",
-                    stats.egress.packets_ingress,
-                    stats.egress.packets_dropped,
-                    stats.egress.bytes_processed,
-                    stats.egress.mask_count,
-                    stats.egress.packets_fragmented,
-                    stats.egress.packets_oversized
+                    stats.ingress.packets_ingress,
+                    stats.ingress.packets_dropped,
+                    stats.ingress.bytes_processed,
+                    stats.ingress.mask_count,
+                    stats.ingress.packets_fragmented,
+                    stats.ingress.packets_oversized
                 );
             }
             Err(e) => eprintln!("  [{}] Failed to read BPF stats: {e}", manager.interface()),
