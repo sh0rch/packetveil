@@ -429,6 +429,11 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
             let single = make_single(&config, peer);
             let mgr = TcBpfManager::new(&peer.name, &single, &mut dispatchers)?;
             managers.push(mgr);
+            // READY=1 was sent before setup, so the watchdog clock is already
+            // running - ping it per peer: MAC/route resolution can take seconds
+            // per peer on a lossy segment, and N peers must not sum past
+            // WatchdogSec for an otherwise healthy startup.
+            sd_notify("WATCHDOG=1");
         }
 
         eprintln!(

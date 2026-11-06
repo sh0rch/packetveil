@@ -896,22 +896,14 @@ pub fn arp_request_reply(target_ip: std::net::Ipv4Addr, ifname: &str) -> Option<
         dst_sll.sll_halen = 6;
         dst_sll.sll_addr[..6].copy_from_slice(&[0xff; 6]);
 
-        // 400 ms recv timeout per attempt
-        let tv = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 400_000,
-        };
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-
         let target_octets = target_ip.octets();
         let mut buf = [0u8; 256];
 
+        // 4 attempts, each with a fixed 400 ms listen window.  The window is a
+        // hard deadline (poll + MSG_DONTWAIT), NOT a per-packet timeout: this
+        // socket receives every ARP frame on the interface, so a sliding
+        // SO_RCVTIMEO would never fire on a busy segment and the loop would
+        // hang startup forever (observed as WatchdogSec SIGABRT on a VPS /24).
         for _ in 0..4 {
             // Send ARP Request
             libc::sendto(
@@ -923,12 +915,29 @@ pub fn arp_request_reply(target_ip: std::net::Ipv4Addr, ifname: &str) -> Option<
                 std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             );
 
-            // Read packets until timeout or we find the ARP Reply
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let end_time = std::time::Instant::now() + std::time::Duration::from_millis(400);
             loop {
-                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
-                if n < 0 {
+                let timeout = end_time
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as i32;
+                if timeout <= 0 {
                     break;
-                } // EAGAIN/timeout → send another request
+                }
+                if libc::poll(&mut pfd, 1, timeout) <= 0 {
+                    continue; // EINTR or expiry - deadline check above terminates
+                }
+                pfd.revents = 0;
+                let n = libc::recv(
+                    fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                );
                 if n < 42 {
                     continue;
                 }
@@ -1103,20 +1112,12 @@ pub fn resolve_mac_via_ttl_probe(
         dst_sll.sll_halen = 6;
         dst_sll.sll_addr[..6].copy_from_slice(&[0xff; 6]);
 
-        let tv = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 400_000,
-        };
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-
         let mut buf = [0u8; 256];
 
+        // 4 attempts, each with a fixed 400 ms listen window (hard deadline via
+        // poll + MSG_DONTWAIT).  This socket receives ALL IPv4 traffic on the
+        // NIC - a per-packet SO_RCVTIMEO would never expire on a host with
+        // continuous inbound traffic, hanging startup forever.
         for _ in 0..4 {
             libc::sendto(
                 fd,
@@ -1127,13 +1128,31 @@ pub fn resolve_mac_via_ttl_probe(
                 std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             );
 
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let end_time = std::time::Instant::now() + std::time::Duration::from_millis(400);
             loop {
-                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
-                if n < 0 {
+                let timeout = end_time
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as i32;
+                if timeout <= 0 {
                     break;
-                } // EAGAIN / timeout → next attempt
-                  // Minimum: 14 (eth) + 20 (ip) + 8 (icmp) = 42
-                if (n as usize) < 42 {
+                }
+                if libc::poll(&mut pfd, 1, timeout) <= 0 {
+                    continue; // EINTR or expiry - deadline check above terminates
+                }
+                pfd.revents = 0;
+                let n = libc::recv(
+                    fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                );
+                // Minimum: 14 (eth) + 20 (ip) + 8 (icmp) = 42
+                if n < 42 {
                     continue;
                 }
                 // EtherType must be IPv4
