@@ -1161,12 +1161,53 @@ fn mmsg_sockaddr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
     }
 }
 
+/// Per-peer userspace runtime: join handles for the spawned threads plus the
+/// RAII guards that must stay alive for the runtime's lifetime.
+struct PeerRuntime {
+    egress_handle: std::thread::JoinHandle<()>,
+    ingress_handles: Vec<std::thread::JoinHandle<()>>,
+    #[cfg(target_os = "windows")]
+    _pinned_route: Option<crate::windows_route::PinnedRoute>,
+    #[cfg(target_os = "windows")]
+    _wfp_bypass: Option<crate::windows_wfp::WfpBypass>,
+}
+
+impl PeerRuntime {
+    fn join(self) -> crate::Result<()> {
+        self.egress_handle
+            .join()
+            .map_err(|_| "egress thread panicked")?;
+        for h in self.ingress_handles {
+            h.join().map_err(|_| "ingress thread panicked")?;
+        }
+        Ok(())
+    }
+}
+
 pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     if config.peers.is_empty() {
         return Err("No peers configured in gutd.conf".into());
     }
 
-    let peer = &config.peers[0];
+    // One userspace runtime per peer. Each peer binds its own UDP ports, so
+    // the OS socket layer already demuxes traffic by port - no dispatcher is
+    // needed (unlike the native datapath, where one NIC hook must demux).
+    // Setup is sequential and fail-fast: a bind/parse error on any peer
+    // aborts startup before later peers' threads are spawned.
+    let mut runtimes = Vec::with_capacity(config.peers.len());
+    for peer in &config.peers {
+        runtimes.push(setup_peer(peer)?);
+    }
+
+    eprintln!("gutd-userspace: {} peer(s) running", runtimes.len());
+
+    for rt in runtimes {
+        rt.join()?;
+    }
+    Ok(())
+}
+
+fn setup_peer(peer: &crate::config::PeerConfig) -> crate::Result<PeerRuntime> {
     let key = peer.key;
     let key_init = chacha_init(&key);
     let rounds: u8 = 4;
@@ -1835,9 +1876,12 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         ingress_handles.push(ingress_handle);
     }
 
-    egress_handle.join().map_err(|_| "egress thread panicked")?;
-    for h in ingress_handles {
-        h.join().map_err(|_| "ingress thread panicked")?;
-    }
-    Ok(())
+    Ok(PeerRuntime {
+        egress_handle,
+        ingress_handles,
+        #[cfg(target_os = "windows")]
+        _pinned_route,
+        #[cfg(target_os = "windows")]
+        _wfp_bypass,
+    })
 }
