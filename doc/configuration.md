@@ -157,6 +157,19 @@ These variables are only used in userspace proxy mode.
 |---|---|---|
 | `GUTD_WG_HOST` | `127.0.0.1:51820` | `ip:port` for the WG-facing socket. **Client mode** (responder=false): gutd binds its local socket to this address — set the WG client Endpoint to this address. **Server mode** (responder=true): gutd sends decapsulated packets to this address — set it to the WG server listen address. In containers (e.g. RouterOS) set to the host/router IP and WG listen port reachable from the container |
 
+> **Port model - the inner destination port is transported verbatim.**
+> gutd embeds the WG packet's destination port into the obfuscated packet,
+> and a **native (eBPF) receiver delivers the decapsulated packet to
+> `tun_local_ip4:<that port>`** — there is no separate WG-listen-port knob
+> on the native receiver. Therefore the remote WireGuard must listen on
+> the same port number your side's WG Endpoint points at. In **userspace
+> client mode** that endpoint is `wg_host`, so its port doubles as the
+> wire-level destination port: with `wg_host = 127.0.0.1:51823`, the
+> remote WG must listen on port **51823 on its own host**. A **userspace**
+> responder ignores the embedded port and delivers to its configured
+> `wg_host` instead. If gutd's ingress counters climb while WireGuard sees
+> nothing, check this pairing first — delivery to a dead port is silent.
+
 ### Runtime overrides (always checked, both modes)
 
 | Env Var | Description |
