@@ -26,23 +26,11 @@ extern "C" fn handle_exit(_: libc::c_int) {
 }
 
 // ──────────────────────────────────────────────────────────────────
-//  Lightweight sd_notify (no external crate)
+//  Lightweight sd_notify lives in the lib so the userspace datapath (which
+//  runs inside gutd::userspace) can ping the watchdog too.
 // ──────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
-fn sd_notify(_msg: &str) {
-    #[cfg(target_family = "unix")]
-    {
-        if let Ok(path) = std::env::var("NOTIFY_SOCKET") {
-            use std::os::unix::net::UnixDatagram;
-            let sock = match UnixDatagram::unbound() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = sock.send_to(_msg.as_bytes(), &path);
-        }
-    }
-}
+use gutd::sdnotify::sd_notify;
 
 // ──────────────────────────────────────────────────────────────────
 //  BPF stats reading
