@@ -1171,6 +1171,18 @@ struct PeerStats {
     /// Packets forwarded remote peer -> WG.
     ingress_pkts: std::sync::atomic::AtomicU64,
     ingress_bytes: std::sync::atomic::AtomicU64,
+    /// Send errors on the wire socket (egress).
+    tx_send_err: std::sync::atomic::AtomicU64,
+    /// All packets received on the wire socket, before any verification.
+    rx_total: std::sync::atomic::AtomicU64,
+    /// Received but rejected by obfs_verify (wrong key/mode or foreign traffic).
+    rx_verify_fail: std::sync::atomic::AtomicU64,
+    /// Verified but failed obfs_decap (corrupt or wrong-size inner packet).
+    rx_decap_fail: std::sync::atomic::AtomicU64,
+    /// Decoded but not delivered: no learned WG peer addr yet (client only).
+    rx_no_wg_peer: std::sync::atomic::AtomicU64,
+    /// Deliverable but send_to to the WG socket failed.
+    rx_send_err: std::sync::atomic::AtomicU64,
 }
 
 pub fn run(config: &crate::config::Config) -> crate::Result<()> {
@@ -1578,10 +1590,12 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         };
 
                         let _r = egress_exts[sock_idx].send_to(final_buf, final_dest);
+                        use std::sync::atomic::Ordering::Relaxed;
                         if let Ok(n) = _r {
-                            use std::sync::atomic::Ordering::Relaxed;
                             egress_stats.egress_pkts.fetch_add(1, Relaxed);
                             egress_stats.egress_bytes.fetch_add(n as u64, Relaxed);
+                        } else {
+                            egress_stats.tx_send_err.fetch_add(1, Relaxed);
                         }
                         #[cfg(debug_assertions)]
                         eprintln!(
@@ -1634,6 +1648,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     };
                     #[cfg(not(target_os = "linux"))]
                     let buf: &mut [u8] = &mut recv_buf[..];
+
+                    use std::sync::atomic::Ordering::Relaxed;
+                    ingress_stats.rx_total.fetch_add(1, Relaxed);
 
                     // Decode Prepend+Base64 before any QUIC detection
                     let mut detected_prepend = None;
@@ -1772,6 +1789,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     };
 
                     if !is_gut {
+                        ingress_stats.rx_verify_fail.fetch_add(1, Relaxed);
                         if is_server {
                             if detected_prepend == Some(crate::config::ObfsMode::Sip) && !was_rtp {
                                 sip_resp.fill(0);
@@ -1853,13 +1871,24 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             ingress_wg_peer.load()
                         };
 
-                        if let Some(d) = dest {
-                            if let Ok(n) = ingress_local.send_to(&buf[..new_size], d) {
-                                use std::sync::atomic::Ordering::Relaxed;
-                                ingress_stats.ingress_pkts.fetch_add(1, Relaxed);
-                                ingress_stats.ingress_bytes.fetch_add(n as u64, Relaxed);
+                        match dest {
+                            Some(d) => match ingress_local.send_to(&buf[..new_size], d) {
+                                Ok(n) => {
+                                    ingress_stats.ingress_pkts.fetch_add(1, Relaxed);
+                                    ingress_stats.ingress_bytes.fetch_add(n as u64, Relaxed);
+                                }
+                                Err(e) => {
+                                    if ingress_stats.rx_send_err.fetch_add(1, Relaxed) < 8 {
+                                        eprintln!("[gutd/ingress] WG delivery to {d} failed: {e}");
+                                    }
+                                }
+                            },
+                            None => {
+                                ingress_stats.rx_no_wg_peer.fetch_add(1, Relaxed);
                             }
                         }
+                    } else {
+                        ingress_stats.rx_decap_fail.fetch_add(1, Relaxed);
                     }
                 }
             })?;
@@ -1885,12 +1914,19 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         if crate::reload::PRINT_STATS.swap(false, Relaxed) {
             eprintln!(
                 "=== gutd statistics (userspace) [{peer_name}] ===\n    \
-                 Egress : pkts={} bytes={}\n    \
-                 Ingress: pkts={} bytes={}",
+                 Egress : pkts={} bytes={} send_err={}\n    \
+                 Ingress: pkts={} bytes={}\n    \
+                 Ingress rx: total={} verify_fail={} decap_fail={} no_wg_peer={} send_err={}",
                 stats.egress_pkts.load(Relaxed),
                 stats.egress_bytes.load(Relaxed),
+                stats.tx_send_err.load(Relaxed),
                 stats.ingress_pkts.load(Relaxed),
                 stats.ingress_bytes.load(Relaxed),
+                stats.rx_total.load(Relaxed),
+                stats.rx_verify_fail.load(Relaxed),
+                stats.rx_decap_fail.load(Relaxed),
+                stats.rx_no_wg_peer.load(Relaxed),
+                stats.rx_send_err.load(Relaxed),
             );
         }
 
