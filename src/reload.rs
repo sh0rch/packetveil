@@ -8,8 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static RELOAD_FLAG: AtomicBool = AtomicBool::new(false);
 /// Shared exit flag — set by signal handlers on all platforms.
 pub static EXIT_FLAG: AtomicBool = AtomicBool::new(false);
+/// Set by the SIGUSR1 handler; each datapath's supervisor loop consumes it and
+/// prints its own stats (BPF map stats in native mode, packet counters in
+/// userspace mode).
+pub static PRINT_STATS: AtomicBool = AtomicBool::new(false);
 
-// ── Unix: SIGHUP ──────────────────────────────────────────────────
+// ── Unix: SIGHUP / SIGUSR1 / SIGINT / SIGTERM ─────────────────────
 
 #[cfg(target_family = "unix")]
 extern "C" fn sighup_handler(_: libc::c_int) {
@@ -17,15 +21,38 @@ extern "C" fn sighup_handler(_: libc::c_int) {
 }
 
 #[cfg(target_family = "unix")]
+extern "C" fn sigusr1_handler(_: libc::c_int) {
+    PRINT_STATS.store(true, Ordering::Relaxed);
+}
+
+#[cfg(target_family = "unix")]
+extern "C" fn exit_handler(_: libc::c_int) {
+    EXIT_FLAG.store(true, Ordering::Relaxed);
+}
+
+#[cfg(target_family = "unix")]
 pub fn setup_signal_handler() -> Result<()> {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sighup_handler as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&raw mut sa.sa_mask);
 
+        sa.sa_sigaction = sighup_handler as *const () as usize;
         if libc::sigaction(libc::SIGHUP, &raw const sa, std::ptr::null_mut()) < 0 {
             return Err("Failed to setup SIGHUP handler".into());
+        }
+
+        sa.sa_sigaction = sigusr1_handler as *const () as usize;
+        if libc::sigaction(libc::SIGUSR1, &raw const sa, std::ptr::null_mut()) < 0 {
+            return Err("Failed to setup SIGUSR1 handler".into());
+        }
+
+        sa.sa_sigaction = exit_handler as *const () as usize;
+        if libc::sigaction(libc::SIGINT, &raw const sa, std::ptr::null_mut()) < 0 {
+            return Err("Failed to setup SIGINT handler".into());
+        }
+        if libc::sigaction(libc::SIGTERM, &raw const sa, std::ptr::null_mut()) < 0 {
+            return Err("Failed to setup SIGTERM handler".into());
         }
     }
 

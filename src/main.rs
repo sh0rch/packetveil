@@ -10,39 +10,17 @@ const DEFAULT_STAT_FILE: &str = "/run/gutd.stat";
 #[cfg(target_family = "windows")]
 const DEFAULT_STAT_FILE: &str = "C:\\ProgramData\\gutd\\gutd.stat";
 
-#[cfg(target_family = "unix")]
-static PRINT_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(target_family = "unix")]
-extern "C" fn handle_sigusr1(_: libc::c_int) {
-    use std::sync::atomic::Ordering;
-    PRINT_STATS.store(true, Ordering::Relaxed);
-}
-
-#[cfg(target_family = "unix")]
-extern "C" fn handle_exit(_: libc::c_int) {
-    use std::sync::atomic::Ordering;
-    reload::EXIT_FLAG.store(true, Ordering::Relaxed);
-}
+// Signal handlers (SIGHUP / SIGUSR1 / SIGINT / SIGTERM on Unix, Ctrl+C on
+// Windows) live in gutd::reload and set shared flags - PRINT_STATS, EXIT_FLAG,
+// RELOAD_FLAG - so both datapaths can consume them regardless of which mode
+// run_daemon dispatches into.
 
 // ──────────────────────────────────────────────────────────────────
-//  Lightweight sd_notify (no external crate)
+//  Lightweight sd_notify lives in the lib so the userspace datapath (which
+//  runs inside gutd::userspace) can send lifecycle notifications too.
 // ──────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
-fn sd_notify(_msg: &str) {
-    #[cfg(target_family = "unix")]
-    {
-        if let Ok(path) = std::env::var("NOTIFY_SOCKET") {
-            use std::os::unix::net::UnixDatagram;
-            let sock = match UnixDatagram::unbound() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = sock.send_to(_msg.as_bytes(), &path);
-        }
-    }
-}
+use gutd::sdnotify::sd_notify;
 
 // ──────────────────────────────────────────────────────────────────
 //  BPF stats reading
@@ -364,6 +342,10 @@ fn cmd_status(args: &[String]) -> Result<()> {
 
 fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<()> {
     sd_notify("READY=1");
+    // Install signal handlers BEFORE the datapath dispatch. In userspace mode
+    // run() blocks forever below, and with default dispositions SIGUSR1/SIGHUP
+    // would kill the daemon and SIGINT/SIGTERM would skip STOPPING=1.
+    reload::setup_signal_handler()?;
     if config.global.userspace_only || std::env::var("GUTD_USERSPACE").is_ok() {
         return gutd::userspace::run(&config);
     }
@@ -379,24 +361,6 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
     #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     let stat_file = config.runtime.stat_file.clone();
 
-    // Signal handlers
-    reload::setup_signal_handler()?;
-    #[cfg(target_family = "unix")]
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_flags = libc::SA_RESTART;
-
-        sa.sa_sigaction = handle_sigusr1 as *const () as usize;
-        libc::sigaction(libc::SIGUSR1, &raw const sa, std::ptr::null_mut());
-
-        sa.sa_sigaction = handle_exit as *const () as usize;
-        libc::sigaction(libc::SIGINT, &raw const sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGTERM, &raw const sa, std::ptr::null_mut());
-    }
-    #[cfg(target_family = "windows")]
-    {
-        // On Windows, Ctrl+C sets EXIT_FLAG via the handler registered in reload module
-    }
     eprintln!("Signal handlers installed");
 
     #[cfg(not(target_os = "linux"))]
@@ -466,7 +430,7 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
                 break;
             }
 
-            if PRINT_STATS.swap(false, Ordering::Relaxed) {
+            if reload::PRINT_STATS.swap(false, Ordering::Relaxed) {
                 print_bpf_stats(&managers);
             }
 
