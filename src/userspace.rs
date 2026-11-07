@@ -1290,10 +1290,16 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     // Client (SIP): must bind to configured ports — SIP INVITE embeds the RTP port
     //   numbers that both sides must agree on; ephemeral binding would break the
     //   SIP session description and RTP striping.
+    // Client (non-SIP, src_ports set): binds the configured source ports so
+    //   firewalls/NAT policies can pin rules instead of guessing ephemeral ports.
     let client_needs_fixed_port = is_server || peer.obfs == crate::config::ObfsMode::Sip;
     let mut ext_sockets = Vec::new();
-    for &port in &peer.ports {
-        let bind_port = if client_needs_fixed_port { port } else { 0 };
+    for (sock_idx, &port) in peer.ports.iter().enumerate() {
+        let bind_port = if client_needs_fixed_port {
+            port
+        } else {
+            peer.src_ports.get(sock_idx).copied().unwrap_or(0)
+        };
         let ext_addr = SocketAddr::new(effective_bind_ip, bind_port);
         let ext_socket = Arc::new(bind_udp(ext_addr)?);
         tune_udp_buffers(&ext_socket, sock_buf_size);
