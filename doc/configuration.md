@@ -156,6 +156,7 @@ These variables are only used in userspace proxy mode.
 | Env Var | Default | Description |
 |---|---|---|
 | `GUTD_WG_HOST` | `127.0.0.1:51820` | `ip:port` for the WG-facing socket. **Client mode** (responder=false): gutd binds its local socket to this address — set the WG client Endpoint to this address. **Server mode** (responder=true): gutd sends decapsulated packets to this address — set it to the WG server listen address. In containers (e.g. RouterOS) set to the host/router IP and WG listen port reachable from the container |
+| `GUTD_SRC_PORTS` | (empty) | Comma-separated local source ports for the ext sockets (client mode only). Must have the same number of entries as `ports` - `src_ports[i]` pairs with `ports[i]`, pinning the wire-level source port so firewalls and the remote responder see deterministic endpoints. Not valid for responders or SIP mode |
 
 ### Runtime overrides (always checked, both modes)
 
