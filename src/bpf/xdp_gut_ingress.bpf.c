@@ -148,6 +148,87 @@ static __always_inline void xor16(__u8 *p, const __u8 *k)
         p[i] ^= k[i];
 }
 
+/* Accumulate the one's-complement checksum of packet bytes [off, off+len).
+ * XDP twin of gut_csum_range() in gut_common.h: all bpf_xdp_load_bytes and
+ * bpf_csum_diff calls use LITERAL constant sizes so the verifier never has
+ * to infer a scalar range for the size argument.  buf64 must be a >=64-byte
+ * scratch region in map-value or stack memory (not packet data).  Same
+ * 1664-byte coverage cap as the egress side — longer datagrams get a wrong
+ * checksum and are dropped, identical to the previous check=0 behaviour. */
+static __always_inline __u64
+xdp_csum_range(struct xdp_md *ctx, __u8 *buf64,
+               __u32 off, __u32 len, __u64 acc)
+{
+    __u32 end = off + len;
+    if (end > off + 1664)
+        end = off + 1664; /* 26x64 — verifier scalar clamp */
+
+#pragma unroll
+    for (int i = 0; i < 26; i++)
+    {
+        if (off + 64 > end)
+            break;
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 64) < 0)
+            break;
+        acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 64, acc);
+        off += 64;
+    }
+
+    if (off + 32 <= end)
+    {
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 32) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 32, acc);
+        off += 32;
+    }
+    if (off + 16 <= end)
+    {
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 16) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 16, acc);
+        off += 16;
+    }
+    if (off + 8 <= end)
+    {
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 8) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 8, acc);
+        off += 8;
+    }
+    if (off + 4 <= end)
+    {
+        if (bpf_xdp_load_bytes(ctx, off, buf64, 4) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 4, acc);
+        off += 4;
+    }
+
+    /* Trailing 1-3 bytes: RFC 768 zero-pad to 4 bytes */
+    {
+        __u8 tbuf[4] = {0, 0, 0, 0};
+        __be32 word = 0;
+        __u32 tail = end - off;
+        if (tail >= 1 && tail <= 3)
+        {
+            if (tail == 1)
+            {
+                bpf_xdp_load_bytes(ctx, off, tbuf, 1);
+                word = bpf_htonl(((__u32)tbuf[0]) << 24);
+            }
+            else if (tail == 2)
+            {
+                bpf_xdp_load_bytes(ctx, off, tbuf, 2);
+                word = bpf_htonl((((__u32)tbuf[0]) << 24) | (((__u32)tbuf[1]) << 16));
+            }
+            else
+            {
+                bpf_xdp_load_bytes(ctx, off, tbuf, 3);
+                word = bpf_htonl((((__u32)tbuf[0]) << 24) | (((__u32)tbuf[1]) << 16) |
+                                 (((__u32)tbuf[2]) << 8));
+            }
+            acc = bpf_csum_diff(0, 0, &word, 4, acc);
+        }
+    }
+
+    return acc;
+}
+
 #if defined(GUT_MODE_B64)
 /* Not needed as separate subprog — b64_decode is called inline to avoid
  * mark_precise explosion from noinline map-value invalidation. */
@@ -235,6 +316,10 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (wg + 12 > (__u8 *)data_end)
         return -1;
 
+    /* Offset of the GUT header within the outer header (nonzero only for
+     * the SIP RTP path, where the 12-byte RTP header precedes GUT). */
+    __u32 gut_hdr_off = 0;
+
 #if defined(GUT_MODE_GUT)
     __u32 outer_hdr_len = GUT_HEADER_SIZE;
 #elif defined(GUT_MODE_SYSLOG)
@@ -281,7 +366,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
 
         /* Strip ballast from decoded GUT inner so we only write net data
-         * to the packet and need a single bpf_xdp_adjust_tail. */
+         * to the packet (no bpf_xdp_adjust_tail needed anywhere). */
         __u32 pad_off = (B64_INNER_OFF + 9) & (SCRATCH_SIZE - 1);
         __u8 pad_byte_s = scratch[pad_off];
         __u32 ballast_s = (pad_byte_s != 0 && (pad_byte_s & 0xC0) == 0) ? (__u32)pad_byte_s : 0;
@@ -302,18 +387,14 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (slen > 1023)
             slen = 1023;
 
-        /* Write decoded GUT inner (without ballast) back to packet */
+        /* Write decoded GUT inner (without ballast) back to packet.
+         * The leftover base64 tail is NOT trimmed — frame resizing via
+         * bpf_xdp_adjust_tail is unreliable on virtio-net (issues #13/#18).
+         * wg_len tracks the logical length; IP/UDP length fields written
+         * at the end make the kernel trim the stale tail itself. */
         if (bpf_xdp_store_bytes(ctx, wg_off,
                                 scratch + B64_INNER_OFF, slen) < 0)
             return -1;
-
-        /* Trim excess tail bytes (base64 expansion + ballast in one op) */
-        __s32 syslog_trim = (__s32)wg_len - (__s32)decoded_len;
-        if (syslog_trim > 0)
-        {
-            if (bpf_xdp_adjust_tail(ctx, -syslog_trim) < 0)
-                return -1;
-        }
 
         /* Re-derive all pointers after packet modifications */
         data = (void *)(__u64)ctx->data;
@@ -341,60 +422,19 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 
     if ((wg[0] & 0xC0) == 0x80 && (wg[1] & 0x7F) == 0x60)
     {
-        /* ── RTP data path: strip 12-byte RTP header → GUT ── */
+        /* ── RTP data path: [RTP hdr(12)][GUT(10)][WG][ballast] ──
+         * Do NOT strip the RTP header in-place: bpf_xdp_adjust_head()
+         * gives driver-dependent results on virtio-net and other real
+         * NICs (issues #13/#18).  Keep it and treat RTP+GUT as one outer
+         * header — the common tail reads the pad byte at
+         * wg[outer_hdr_len-1] (= GUT byte 9) and slides the WG payload
+         * to wg_off via scratch, so no frame resize is ever needed. */
         __u32 gut_data_len = wg_len - GUT_RTP_HEADER_SIZE;
         gut_data_len &= 0xFFF;
         if (gut_data_len < GUT_HEADER_SIZE + WG_MIN_PACKET ||
             gut_data_len > 1500)
             return -1;
-
-        /* Re-bound for verifier: spill across branches loses umin tracking.
-         * asm goto+0 is a nop on kernel 6.1 — use plain mask + branch. */
-        asm volatile("%[v] &= 2047" : [v] "+r"(gut_data_len) : :);
-        if (gut_data_len < 42 || gut_data_len > 1500)
-            return -1;
-
-        /* Strip RTP header directly from packet.
-         * The RTP header is 12 bytes at wg_off.
-         * Shift Ethernet+IP+UDP(8) headers forward to cover the hole. */
-        __u32 shift_len_head = udp_off + 8;
-        if (shift_len_head > 62)
-            return -1;
-
-        /* 1. Load original headers into scratch */
-
-        for (int i = 0; i < 62; i++)
-        {
-            if (i >= shift_len_head)
-                break;
-            scratch[256 + i] = ((__u8 *)data)[i];
-        }
-
-        /* 2. Remove the 12-byte RTP header from the start of the packet data */
-        if (bpf_xdp_adjust_head(ctx, (int)GUT_RTP_HEADER_SIZE) < 0)
-            return -1;
-
-        /* 3. Restore headers at the new start position */
-        data = (void *)(__u64)ctx->data;
-        data_end = (void *)(__u64)ctx->data_end;
-        if ((__u8 *)data + shift_len_head > (__u8 *)data_end)
-            return -1;
-
-        for (int i = 0; i < 62; i++)
-        {
-            if (i >= shift_len_head)
-                break;
-            ((__u8 *)data)[i] = scratch[256 + i];
-        }
-
-        /* Re-derive all pointers for subsequent processing */
-        eth = data;
-        udph = (void *)((__u8 *)data + udp_off);
-        wg = (__u8 *)data + wg_off;
-        wg_len = gut_data_len;
-        if (wg + GUT_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
-            return -1;
-        udp_len = 8 + (__u16)gut_data_len;
+        gut_hdr_off = GUT_RTP_HEADER_SIZE;
     }
     else if (wg[0] == 'M' || wg[0] == 'R' || wg[0] == 'O' ||
              wg[0] == 'S' || wg[0] == 'I' || wg[0] == 'B' ||
@@ -502,18 +542,14 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (decoded_len > 1023)
             decoded_len = 1023;
 
-        /* Write decoded GUT inner back to packet */
+        /* Write decoded GUT inner back to packet.
+         * The leftover base64 tail is NOT trimmed — frame resizing via
+         * bpf_xdp_adjust_tail is unreliable on virtio-net (issues #13/#18).
+         * wg_len tracks the logical length; IP/UDP length fields written
+         * at the end make the kernel trim the stale tail itself. */
         if (bpf_xdp_store_bytes(ctx, wg_off,
                                 scratch + B64_INNER_OFF, decoded_len) < 0)
             return -1;
-
-        /* Trim excess tail bytes */
-        __s32 sip_trim = (__s32)wg_len - (__s32)decoded_len;
-        if (sip_trim > 0)
-        {
-            if (bpf_xdp_adjust_tail(ctx, -sip_trim) < 0)
-                return -1;
-        }
 
         /* Re-derive all pointers */
         data = (void *)(__u64)ctx->data;
@@ -536,8 +572,10 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     {
         return -1; /* not RTP and not SIP — reject */
     }
-    /* Packet is now in GUT format — fall through to GUT processing */
-    __u32 outer_hdr_len = GUT_HEADER_SIZE;
+    /* Packet is now in GUT format — fall through to GUT processing.
+     * RTP path: outer header = RTP(12) + GUT(10); the GUT header itself
+     * sits at wg_off + gut_hdr_off.  Signaling path: gut_hdr_off == 0. */
+    __u32 outer_hdr_len = GUT_HEADER_SIZE + gut_hdr_off;
 #else /* GUT_MODE_QUIC */
     __u32 outer_hdr_len = 0;
     if (wg[0] == 0x40)
@@ -592,7 +630,10 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     __u32 expected_dcid = ks47[9];
 #endif
 
-    __u8 *quic = wg - outer_hdr_len;
+    /* Pointer to the outer (mode-specific) header carrying PPN/enc_ports.
+     * For the SIP RTP path it sits gut_hdr_off bytes into outer_hdr_len;
+     * forward arithmetic keeps the verifier's range tracking simple. */
+    __u8 *quic = (__u8 *)data + wg_off + gut_hdr_off;
 
 #if defined(GUT_MODE_GUT) || defined(GUT_MODE_B64)
     {
@@ -704,6 +745,11 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             }
             ep.port = bpf_ntohs(udph->source);
             ep.server_port = bpf_ntohs(udph->dest);
+            /* The inbound frame's src MAC is always the correct L2 next-hop
+             * for replies: the peer's own MAC when on-link, the gateway's
+             * MAC when routed.  cfg->dst_mac (default-gw) is wrong for
+             * on-link/multi-homed peers. */
+            __builtin_memcpy(ep.mac, eth->h_source, 6);
             ep.valid = 1;
             ep.obfs_gut = 0;
             /* Type 1 (WG Init from client): use BPF_NOEXIST so we never overwrite a
@@ -873,25 +919,27 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         }
     }
 
-    /* ── Virtio-net / e1000-safe packet resize ────────────────────────────
-     * bpf_xdp_adjust_head() gives driver-dependent results on virtio-net
-     * (mergeable RX buffers) and other real NICs: the helper may succeed
-     * on veth but silently mis-size the frame on virtio-net, causing
-     * wrong-length WireGuard packets on every cloud/VPS deployment.
+    /* ── Driver-agnostic packet resize: never touch frame boundaries ──────
+     * bpf_xdp_adjust_head() / bpf_xdp_adjust_tail() produce results that
+     * depend on NIC buffer layout: on virtio-net with mergeable RX the
+     * shrink was a silent no-op, and with mrg_rxbuf=off it removed far
+     * more than requested (issue #13 measured a 71-byte cut for a 20-byte
+     * request).  Whatever the exact mechanism, the outcome was a wrong
+     * data_end — wrong-length or truncated WireGuard packets dropped
+     * silently in wg_packet_receive() (issues #13/#18).
      *
-     * Fix: do NOT call adjust_head at all.  Instead, slide the WG inner
-     * payload backward over the outer header using scratch as a relay,
-     * then shrink the tail with a single adjust_tail.
+     * Fix: do NOT resize the XDP frame at all.  Slide the WG inner payload
+     * backward over the outer header using scratch as a relay (a pure
+     * data-region copy via bpf_xdp_load/store_bytes — proven reliable on
+     * virtio-net), and rely on the IP tot_len / UDP len fields already
+     * written above.  The frame keeps its original wire size; the stale
+     * tail is trimmed by the kernel itself: ip_rcv() calls
+     * pskb_trim_rcsum(skb, iph->tot_len) and the UDP layer enforces
+     * udph->len — WireGuard always receives the exact inner payload on
+     * every driver.
      *
      * Layout before:  [Eth+IP+UDP(wg_off)] [outer_hdr(outer_hdr_len)] [WG(inner_wg_len)] [ballast(tail_total)]
-     * Layout after:   [Eth+IP+UDP(wg_off)] [WG(inner_wg_len)] <stale tail>
-     *
-     * The stale tail is trimmed by adjust_tail(-(outer_hdr_len+tail_total)).
-     * If adjust_tail is a silent no-op on this NIC driver (e.g. virtio-net
-     * with mrg_rxbuf=on), the IP and UDP length fields have already been
-     * set to the correct inner size.  The kernel network stack calls
-     * pskb_trim_rcsum(skb, iph->tot_len) in ip_rcv() before the sk_buff
-     * reaches WireGuard, so WireGuard always receives the right payload. */
+     * Layout after:   [Eth+IP+UDP(wg_off)] [WG(inner_wg_len)] <stale tail, trimmed by IP stack> */
     __u32 inner_wg_len = wg_len - tail_total;
     if (inner_wg_len < WG_MIN_PACKET || inner_wg_len > MAX_INNER_TECH_LIMIT)
         return -1;
@@ -911,37 +959,64 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      *   SIP_SCAN_OFF   @ scratch[2560..3583] — SIP mode only, already consumed
      * scratch[512..512+MAX_INNER_TECH_LIMIT-1] is free for all modes here. */
     __u32 src_pkt_off = (wg_off + outer_hdr_len) & 0xFFFF;
+
+    /* Strip an inline 802.1Q tag if present: ip_off > sizeof(*eth) means
+     * a 4-byte tag sits between the EtherType and the IP header.  A tagged
+     * frame arriving on gut0 finds no VLAN sub-interface, is marked
+     * PACKET_OTHERHOST, and is dropped by ip_rcv — so deliver it untagged
+     * instead.  The tag is removed by shifting IP+UDP headers left over it
+     * (scratch relay, no frame resize — same mechanism as the payload slide
+     * below).  The header copy MUST precede the payload store: writing the
+     * payload at wg_off-4 would clobber the last 4 source header bytes at
+     * [wg_off-4, wg_off) before they are copied. */
+    __u32 tag_adj = ip_off - sizeof(*eth); /* 0 (untagged) or 4 (802.1Q) */
+    if (tag_adj)
+    {
+        __u32 hlen = wg_off - ip_off; /* IP+UDP headers: 28 (v4) / 48 (v6) */
+        asm volatile("" : "+r"(hlen));
+        if (hlen > 56)
+            return -1;
+        if (bpf_xdp_load_bytes(ctx, ip_off, scratch + 256, hlen) < 0)
+            return -1;
+        if (bpf_xdp_store_bytes(ctx, ip_off - tag_adj, scratch + 256, hlen) < 0)
+            return -1;
+    }
+
     if (bpf_xdp_load_bytes(ctx, src_pkt_off, scratch + 512, inner_wg_len) < 0)
         return -1;
 
-    /* Write WG payload at wg_off, overwriting the outer header.
+    /* Write WG payload at wg_off(-tag_adj), overwriting the outer header.
      * Eth+IP+UDP headers at [0, wg_off) are not touched by this store. */
-    if (bpf_xdp_store_bytes(ctx, wg_off, scratch + 512, inner_wg_len) < 0)
+    if (bpf_xdp_store_bytes(ctx, wg_off - tag_adj, scratch + 512, inner_wg_len) < 0)
     {
         stats->packets_dropped++;
         return -1;
     }
 
-    /* Trim the now-stale outer_hdr + ballast from the tail.
-     * Return value is intentionally ignored: NIC drivers that do not honour
-     * adjust_tail (e.g. virtio-net mergeable) are handled by ip_rcv() via
-     * iph->tot_len which was already written with the correct inner size. */
-    bpf_xdp_adjust_tail(ctx, -(int)(outer_hdr_len + tail_total));
-
+    /* No bpf_xdp_adjust_tail call here: the stale outer_hdr + ballast tail
+     * is left in the frame and trimmed by the IP stack (see above).
+     * data/data_end are re-read only because bpf_xdp_store_bytes may
+     * invalidate packet pointers for the verifier — not because the
+     * frame geometry changed (it didn't). */
     data = (void *)(__u64)ctx->data;
     data_end = (void *)(__u64)ctx->data_end;
     eth = data;
     if ((void *)(eth + 1) > data_end)
         return -1;
 
+    /* Header positions after the optional VLAN shift: everything left of
+     * wg_off moved tag_adj bytes toward the start. */
+    __u32 ip_off2 = ip_off - tag_adj;
+    __u32 udp_off2 = udp_off - tag_adj;
+
     __u32 inner_new_len = (ipver == 6) ? (40 + (__u32)new_udp_len) : (20 + (__u32)new_udp_len);
-    if ((__u8 *)data + ip_off + inner_new_len > (__u8 *)data_end)
+    if ((__u8 *)data + ip_off2 + inner_new_len > (__u8 *)data_end)
         return -1;
 
     if (ipver == 4)
     {
-        struct iphdr *iph = (void *)((__u8 *)data + ip_off);
-        struct udphdr *udp = (void *)((__u8 *)data + udp_off);
+        struct iphdr *iph = (void *)((__u8 *)data + ip_off2);
+        struct udphdr *udp = (void *)((__u8 *)data + udp_off2);
         if ((void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end)
             return -1;
 
@@ -949,31 +1024,52 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(*iph), 0);
         iph->check = csum_fold(ip_csum);
 
-        udp->check = 0;
         udp->source = inner_sport_ne;
         udp->dest = inner_dport_ne;
+        udp->check = 0;
+
+        /* Compute a real checksum instead of leaving 0: RFC 768 permits
+         * zero, but conntrack on kernel >= 6.12 (nf_conntrack_checksum)
+         * marks such packets INVALID and firewalls often drop them. */
+        __u64 csum = bpf_csum_diff(0, 0, (__be32 *)&iph->saddr, 8, 0);
+        __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | (__u32)new_udp_len);
+        csum = bpf_csum_diff(0, 0, &ph, 4, csum);
+        csum = xdp_csum_range(ctx, scratch + 256, udp_off2, (__u32)new_udp_len, csum);
+        udp->check = csum_fold(csum);
+        if (udp->check == 0)
+            udp->check = 0xFFFF; /* a computed 0 is sent as 0xFFFF (RFC 768) */
     }
     else
     {
-        struct ipv6hdr *ip6h = (void *)((__u8 *)data + ip_off);
-        struct udphdr *udp = (void *)((__u8 *)data + udp_off);
+        struct ipv6hdr *ip6h = (void *)((__u8 *)data + ip_off2);
+        struct udphdr *udp = (void *)((__u8 *)data + udp_off2);
         if ((void *)(ip6h + 1) > data_end || (void *)(udp + 1) > data_end)
             return -1;
 
         udp->source = inner_sport_ne;
         udp->dest = inner_dport_ne;
-
-        /* IPv6 UDP checksum is mandatory per RFC 8200, but we deliver via
-         * bpf_redirect_map → local veth which sets CHECKSUM_UNNECESSARY on
-         * the skb — the stack will not validate it.  Full recomputation via
-         * calc_payload_csum is too expensive here (register pressure causes
-         * pragma unroll failures with the 62-iteration header-copy loops). */
         udp->check = 0;
+
+        /* UDPv6 checksum is mandatory (RFC 8200): __udp6_lib_rcv drops a
+         * zero checksum unless the socket sets no_check6_rx, and the WG
+         * socket does not — so compute the real value: pseudo-header +
+         * UDP header (check=0) + payload, summed from the packet over
+         * [udp_off2, udp_off2+new_udp_len). */
+        __u64 csum = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0);
+        __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | (__u32)new_udp_len);
+        csum = bpf_csum_diff(0, 0, &ph, 4, csum);
+        csum = xdp_csum_range(ctx, scratch + 256, udp_off2, (__u32)new_udp_len, csum);
+        udp->check = csum_fold(csum);
+        if (udp->check == 0)
+            udp->check = 0xFFFF; /* a computed 0 is sent as 0xFFFF (RFC 768) */
     }
 
     __builtin_memcpy(eth->h_dest, cfg->tun_mac, 6);
     __builtin_memcpy(eth->h_source, cfg->src_mac, 6);
-    eth->h_proto = bpf_htons(ipver == 6 ? ETH_P_IPV6 : ETH_P_IP);
+    /* Deliver untagged: for VLAN ingress the tag was removed above, so
+     * the inner protocol is the right EtherType; for untagged ingress this
+     * is the original value anyway. */
+    eth->h_proto = (__be16)eth_proto;
 
     stats->mask_count++;
     stats->packets_processed++;
@@ -1093,10 +1189,16 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     __u32 new_udp_len = 8 + new_quic_len;
     __u32 new_pkt_len = udp_off + new_udp_len;
 
-    /* Resize the packet to the exact response length */
+    /* Best-effort resize to the exact response length.  The return value
+     * is intentionally ignored: bpf_xdp_adjust_tail gives driver-dependent
+     * results on virtio-net and other real NICs (issues #13/#18).
+     * new_pkt_len is always < the original probe size, so a shrink here
+     * can at most be a no-op (stale tail bytes remain — the UDP/IP length
+     * fields written below make the response self-describing and the
+     * receiver ignores the excess) or an over-shrink, which the bounds
+     * checks after pointer re-derivation catch before any write. */
     int delta = new_pkt_len - (__u32)((__u8 *)data_end - (__u8 *)data);
-    if (bpf_xdp_adjust_tail(ctx, delta))
-        return XDP_PASS;
+    bpf_xdp_adjust_tail(ctx, delta);
 
     /* Build QUIC Version Negotiation in scratch map buffer (offset 320).
      * Writing variable-length DCID/SCID into a map value avoids the verifier
@@ -1320,13 +1422,17 @@ static __always_inline int handle_sip_probe(struct xdp_md *ctx)
         status_len = 44;
     }
 
-    /* Trim packet to fit response */
+    /* Trim packet to fit response — best-effort.  Return values are
+     * ignored: bpf_xdp_adjust_tail gives driver-dependent results on
+     * virtio-net (issues #13/#18).  For a shrink, a no-op just leaves
+     * stale tail bytes (the receiver honors the UDP length); an
+     * over-shrink or a failed grow is caught by the bounds checks and
+     * bpf_xdp_store_bytes below. */
     __u32 current_payload = bpf_ntohs(udph->len) - 8;
     if (status_len < current_payload)
     {
         __s32 trim = (__s32)current_payload - (__s32)status_len;
-        if (bpf_xdp_adjust_tail(ctx, -trim) < 0)
-            return XDP_PASS;
+        bpf_xdp_adjust_tail(ctx, -trim);
     }
     else if (status_len > current_payload)
     {
