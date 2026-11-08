@@ -1161,10 +1161,42 @@ fn mmsg_sockaddr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
     }
 }
 
+/// Per-peer packet counters for SIGUSR1 stats (userspace equivalent of the
+/// BPF stats map in native mode).
+#[derive(Default)]
+struct PeerStats {
+    /// Packets forwarded WG -> remote peer.
+    egress_pkts: std::sync::atomic::AtomicU64,
+    egress_bytes: std::sync::atomic::AtomicU64,
+    /// Packets forwarded remote peer -> WG.
+    ingress_pkts: std::sync::atomic::AtomicU64,
+    ingress_bytes: std::sync::atomic::AtomicU64,
+    /// Send errors on the wire socket (egress).
+    tx_send_err: std::sync::atomic::AtomicU64,
+    /// All packets received on the wire socket, before any verification.
+    rx_total: std::sync::atomic::AtomicU64,
+    /// Received but rejected by obfs_verify (wrong key/mode or foreign traffic).
+    rx_verify_fail: std::sync::atomic::AtomicU64,
+    /// Verified but failed obfs_decap (corrupt or wrong-size inner packet).
+    rx_decap_fail: std::sync::atomic::AtomicU64,
+    /// Decoded but not delivered: no learned WG peer addr yet (client only).
+    rx_no_wg_peer: std::sync::atomic::AtomicU64,
+    /// Deliverable but send_to to the WG socket failed.
+    rx_send_err: std::sync::atomic::AtomicU64,
+}
+
 pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     if config.peers.is_empty() {
         return Err("No peers configured in gutd.conf".into());
     }
+
+    // READY=1 was sent in run_daemon before mode dispatch, so the watchdog
+    // clock is already running. Without periodic WATCHDOG=1 pings, systemd
+    // kills us WatchdogSec seconds after READY - the native datapath pings
+    // from its main loop, but this mode only has worker threads.
+    crate::sdnotify::spawn_watchdog();
+
+    let stats = Arc::new(PeerStats::default());
 
     let peer = &config.peers[0];
     let key = peer.key;
@@ -1342,6 +1374,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let egress_peer = peer.clone();
     let egress_client_obfs = Arc::clone(&client_obfs);
     let egress_peer_ext = Arc::clone(&shared_peer_ext);
+    let egress_stats = Arc::clone(&stats);
     let egress_handle = std::thread::Builder::new()
         .name("gutd-egress".into())
         .spawn(move || {
@@ -1557,6 +1590,13 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         };
 
                         let _r = egress_exts[sock_idx].send_to(final_buf, final_dest);
+                        use std::sync::atomic::Ordering::Relaxed;
+                        if let Ok(n) = _r {
+                            egress_stats.egress_pkts.fetch_add(1, Relaxed);
+                            egress_stats.egress_bytes.fetch_add(n as u64, Relaxed);
+                        } else {
+                            egress_stats.tx_send_err.fetch_add(1, Relaxed);
+                        }
                         #[cfg(debug_assertions)]
                         eprintln!(
                             "[gutd/egress] send {} B → {} via sock[{}] result={:?}",
@@ -1582,6 +1622,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         let ingress_peer_ext = Arc::clone(&shared_peer_ext);
         let ingress_peer = peer.clone();
         let ingress_ballast_align = ingress_peer.ballast == crate::config::BallastMode::Align;
+        let ingress_stats = Arc::clone(&stats);
 
         let ingress_handle = std::thread::Builder::new()
             .name(format!("gutd-ingress-{}", port_idx))
@@ -1607,6 +1648,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     };
                     #[cfg(not(target_os = "linux"))]
                     let buf: &mut [u8] = &mut recv_buf[..];
+
+                    use std::sync::atomic::Ordering::Relaxed;
+                    ingress_stats.rx_total.fetch_add(1, Relaxed);
 
                     // Decode Prepend+Base64 before any QUIC detection
                     let mut detected_prepend = None;
@@ -1745,6 +1789,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     };
 
                     if !is_gut {
+                        ingress_stats.rx_verify_fail.fetch_add(1, Relaxed);
                         if is_server {
                             if detected_prepend == Some(crate::config::ObfsMode::Sip) && !was_rtp {
                                 sip_resp.fill(0);
@@ -1826,18 +1871,75 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             ingress_wg_peer.load()
                         };
 
-                        if let Some(d) = dest {
-                            let _ = ingress_local.send_to(&buf[..new_size], d);
+                        match dest {
+                            Some(d) => match ingress_local.send_to(&buf[..new_size], d) {
+                                Ok(n) => {
+                                    ingress_stats.ingress_pkts.fetch_add(1, Relaxed);
+                                    ingress_stats.ingress_bytes.fetch_add(n as u64, Relaxed);
+                                }
+                                Err(e) => {
+                                    if ingress_stats.rx_send_err.fetch_add(1, Relaxed) < 8 {
+                                        eprintln!("[gutd/ingress] WG delivery to {d} failed: {e}");
+                                    }
+                                }
+                            },
+                            None => {
+                                ingress_stats.rx_no_wg_peer.fetch_add(1, Relaxed);
+                            }
                         }
+                    } else {
+                        ingress_stats.rx_decap_fail.fetch_add(1, Relaxed);
                     }
                 }
             })?;
         ingress_handles.push(ingress_handle);
     }
 
-    egress_handle.join().map_err(|_| "egress thread panicked")?;
-    for h in ingress_handles {
-        h.join().map_err(|_| "ingress thread panicked")?;
+    // Supervisor loop (userspace equivalent of the native main loop):
+    // workers block on recv forever, so this thread owns signal consumption.
+    // EXIT_FLAG  - graceful stop; returning drops the RAII guards (Windows
+    //              route pin / WFP bypass) before process exit.
+    // PRINT_STATS - set by SIGUSR1; print packet counters like print_bpf_stats.
+    // RELOAD_FLAG - SIGHUP has no userspace reload path; acknowledge and clear.
+    let peer_name = peer.name.clone();
+    loop {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if crate::reload::EXIT_FLAG.load(Relaxed) {
+            eprintln!("Received exit signal, shutting down...");
+            crate::sdnotify::sd_notify("STOPPING=1");
+            return Ok(());
+        }
+
+        if crate::reload::PRINT_STATS.swap(false, Relaxed) {
+            eprintln!(
+                "=== gutd statistics (userspace) [{peer_name}] ===\n    \
+                 Egress : pkts={} bytes={} send_err={}\n    \
+                 Ingress: pkts={} bytes={}\n    \
+                 Ingress rx: total={} verify_fail={} decap_fail={} no_wg_peer={} send_err={}",
+                stats.egress_pkts.load(Relaxed),
+                stats.egress_bytes.load(Relaxed),
+                stats.tx_send_err.load(Relaxed),
+                stats.ingress_pkts.load(Relaxed),
+                stats.ingress_bytes.load(Relaxed),
+                stats.rx_total.load(Relaxed),
+                stats.rx_verify_fail.load(Relaxed),
+                stats.rx_decap_fail.load(Relaxed),
+                stats.rx_no_wg_peer.load(Relaxed),
+                stats.rx_send_err.load(Relaxed),
+            );
+        }
+
+        if crate::reload::should_reload() {
+            crate::reload::clear_reload_flag();
+            eprintln!("SIGHUP received - config reload is not supported in userspace mode");
+        }
+
+        // A dead worker means this peer silently stopped forwarding.
+        if egress_handle.is_finished() || ingress_handles.iter().any(|h| h.is_finished()) {
+            return Err("worker thread exited unexpectedly".into());
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    Ok(())
 }

@@ -6,6 +6,7 @@ pub mod installer;
 pub mod netlink;
 pub mod proto;
 pub mod reload;
+pub mod sdnotify;
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 pub mod tc;
 #[cfg(target_os = "linux")]
