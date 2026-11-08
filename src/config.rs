@@ -86,6 +86,10 @@ pub struct PeerConfig {
     /// Ports the remote peer listens on (egress target).
     /// Defaults to `ports` when not explicitly configured — backward compatible.
     pub peer_ports: Vec<u16>,
+    /// Local source ports the ext sockets bind to (userspace client only).
+    /// Empty = ephemeral (OS-assigned) ports. When set, must have the same
+    /// number of entries as `ports`.
+    pub src_ports: Vec<u16>,
     pub key: [u8; 32],
     pub keepalive_drop_percent: u8,
     pub outer_mtu: u16,
@@ -128,6 +132,8 @@ pub fn load_config(path: &str) -> Result<Config> {
 /// - `GUTD_NIC`                — ingress NIC override    [default: auto-detect]
 /// - `GUTD_DEFAULT_POLICY`     — `allow` or `drop`       [default: `allow`]
 /// - `GUTD_KEEPALIVE_DROP_PCT` — keepalive drop %        [default: `30`]
+/// - `GUTD_SRC_PORTS`          — local source ports for ext sockets (client only);
+///   comma list matching `GUTD_PORTS` count, ephemeral when unset
 /// - `GUTD_OWN_HTTP3`          — `true`/`false`          [default: `true`]
 /// - `GUTD_STATS_INTERVAL`     — stats interval seconds  [default: `5`]
 /// - `GUTD_STAT_FILE`          — stat file path          [default: `/run/gutd.stat`]
@@ -207,6 +213,33 @@ pub fn load_config_from_env() -> Result<Config> {
             return Err("GUTD_PORTS: port 0 is not allowed".into());
         }
     }
+
+    // GUTD_SRC_PORTS optionally fixes the local source ports the ext sockets bind
+    // to (ephemeral when unset). Must match GUTD_PORTS in count.
+    let src_ports: Vec<u16> = if let Ok(sp_str) = std::env::var("GUTD_SRC_PORTS") {
+        let parsed: std::result::Result<Vec<u16>, _> = sp_str
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<u16>()
+                    .map_err(|e| format!("GUTD_SRC_PORTS: invalid port '{s}': {e}"))
+            })
+            .collect();
+        let parsed = parsed?;
+        if parsed.len() != ports.len() {
+            return Err(format!(
+                "GUTD_SRC_PORTS must have exactly {} entries to match GUTD_PORTS",
+                ports.len()
+            )
+            .into());
+        }
+        if parsed.contains(&0) {
+            return Err("GUTD_SRC_PORTS: port 0 is not allowed".into());
+        }
+        parsed
+    } else {
+        Vec::new()
+    };
 
     // GUTD_PEER_PORTS overrides which ports are used as egress targets (remote peer ports).
     // Defaults to GUTD_PORTS for backward compatibility.
@@ -314,6 +347,13 @@ pub fn load_config_from_env() -> Result<Config> {
                 .into(),
         );
     }
+    if !src_ports.is_empty() && (responder || obfs == ObfsMode::Sip) {
+        return Err(
+            "GUTD_SRC_PORTS is only valid for non-SIP clients: responders and SIP \
+             clients already bind GUTD_PORTS"
+                .into(),
+        );
+    }
 
     let stats_interval: u32 = std::env::var("GUTD_STATS_INTERVAL")
         .unwrap_or_else(|_| "5".to_string())
@@ -343,6 +383,7 @@ pub fn load_config_from_env() -> Result<Config> {
             responder,
             ports: ports.clone(),
             peer_ports,
+            src_ports,
             key,
             keepalive_drop_percent,
             outer_mtu,
@@ -377,6 +418,7 @@ struct PeerBuilder {
     responder: Option<bool>,
     ports: Option<Vec<u16>>,
     peer_ports: Option<Vec<u16>>,
+    src_ports: Option<Vec<u16>>,
     key: Option<[u8; 32]>,
     passphrase: Option<String>,
     keepalive_drop_percent: u8,
@@ -402,6 +444,7 @@ impl Default for PeerBuilder {
             responder: None,
             ports: None,
             peer_ports: None,
+            src_ports: None,
             key: None,
             passphrase: None,
             keepalive_drop_percent: 30,
@@ -465,6 +508,30 @@ impl PeerBuilder {
             )
             .into());
         }
+        let src_ports = self.src_ports.unwrap_or_default();
+        if !src_ports.is_empty() {
+            if responder || self.obfs == ObfsMode::Sip {
+                return Err(format!(
+                    "src_ports is only valid for non-SIP clients (peer '{}'): \
+                     responders and SIP clients already bind `ports`",
+                    self.name
+                )
+                .into());
+            }
+            if src_ports.len() != ports.len() {
+                return Err(format!(
+                    "src_ports must have exactly {} entries to match `ports` (peer '{}')",
+                    ports.len(),
+                    self.name
+                )
+                .into());
+            }
+            if src_ports.contains(&0) {
+                return Err(
+                    format!("src_ports must be in range 1..65535 (peer '{}')", self.name).into(),
+                );
+            }
+        }
         if self.ballast == BallastMode::Align && self.obfs != ObfsMode::Gut {
             return Err(format!(
                 "ballast = align requires obfs = gut (peer '{}'): QUIC alignment is a \
@@ -503,6 +570,7 @@ impl PeerBuilder {
             responder,
             ports,
             peer_ports,
+            src_ports,
             key,
             keepalive_drop_percent: self.keepalive_drop_percent,
             outer_mtu,
@@ -640,6 +708,21 @@ fn parse_config(content: &str) -> Result<Config> {
                                 return Err("peer_ports must not be empty".into());
                             }
                             b.peer_ports = Some(parsed);
+                        }
+                        "src_ports" => {
+                            let parsed: Result<Vec<u16>> = value
+                                .split(',')
+                                .map(|s| {
+                                    s.trim()
+                                        .parse()
+                                        .map_err(|e| format!("Port parse error: {e}").into())
+                                })
+                                .collect();
+                            let parsed = parsed?;
+                            if parsed.is_empty() {
+                                return Err("src_ports must not be empty".into());
+                            }
+                            b.src_ports = Some(parsed);
                         }
                         "key" => {
                             b.key = Some(parse_hex_key(value.trim())?);

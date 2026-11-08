@@ -39,6 +39,7 @@ All modes apply ChaCha payload masking on top of the envelope. Both peers must u
 - Pure userspace fallback mode (zero eBPF requirements, ~500 Mbps capable)
 - Cross-platform: Linux (eBPF + userspace), Windows (userspace), RouterOS (userspace)
 - Multi-peer support (one veth pair + BPF program per peer)
+- Optional fixed client source ports in userspace mode (`src_ports`)
 - Static musl build, zero OS dependencies — runs in empty `scratch` containers
 - IPv4 and IPv6 outer transport
 - Dynamic peer endpoint learning for clients behind NAT (`peer_ip = dynamic`)
