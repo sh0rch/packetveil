@@ -1166,6 +1166,12 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         return Err("No peers configured in gutd.conf".into());
     }
 
+    // READY=1 was sent in run_daemon before mode dispatch, so the watchdog
+    // clock is already running. Without periodic WATCHDOG=1 pings, systemd
+    // kills us WatchdogSec seconds after READY - the native datapath pings
+    // from its main loop, but this mode only has worker threads.
+    crate::sdnotify::spawn_watchdog();
+
     let peer = &config.peers[0];
     let key = peer.key;
     let key_init = chacha_init(&key);
